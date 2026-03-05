@@ -29,7 +29,7 @@ function App() {
         
         {/* Protected Routes */}
         <Route path="/*" element={
-           <ProtectedRoute>
+          //  <ProtectedRoute>
             <AccessControlProvider>
               <div className="App min-h-screen flex bg-gray-50">
                 <Sidebar />
@@ -58,7 +58,7 @@ function App() {
                 </main>
               </div>
             </AccessControlProvider>
-         </ProtectedRoute>
+        //  </ProtectedRoute>
         } />
       </Routes>
     </Router>

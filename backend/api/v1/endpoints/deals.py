@@ -237,7 +237,7 @@ def _render_offer_letter_html(deal: Deal) -> str:
         if logo_uri else
         '<div class="logo-fallback">ALOK INGOTS</div>'
     )
-
+ 
     return f"""
     <!DOCTYPE html>
     <html>
