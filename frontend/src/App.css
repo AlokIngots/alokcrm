@@ -1,0 +1,105 @@
+/* Prevent horizontal scrolling for the entire app */
+html, body {
+  overflow-x: hidden;
+  margin: 0;
+  padding: 0;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+.App {
+  height: 100vh;
+  display: flex;
+  margin: 0;
+  padding: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+  overflow: hidden;
+}
+
+/* Ensure main content area handles overflow properly */
+.main-content {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+}
+
+/* Remove unused styles */
+.App-logo {
+  height: 40vmin;
+  pointer-events: none;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .App-logo {
+    animation: App-logo-spin infinite 20s linear;
+  }
+}
+
+.App-header {
+  background-color: #282c34;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  font-size: calc(10px + 2vmin);
+  color: white;
+}
+
+.App-link {
+  color: #61dafb;
+}
+
+@keyframes App-logo-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Pipeline specific styles */
+.pipeline-container {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.pipeline-header {
+  flex-shrink: 0;
+  width: 100%;
+  position: relative;
+  z-index: 10;
+}
+
+.pipeline-content {
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+}
+
+.pipeline-scroll-area {
+  height: 100%;
+  overflow-x: auto;
+  overflow-y: auto;
+}
+
+/* Stage column styles */
+.stage-column {
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.stage-droppable-area {
+  flex: 1;
+  min-height: 300px;
+  overflow-y: auto;
+}
