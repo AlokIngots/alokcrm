@@ -1,27 +1,30 @@
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-sqlalchemy==2.0.23
+fastapi
+uvicorn[standard]
+sqlalchemy
 pydantic
 pydantic-settings
-python-multipart==0.0.6
-python-jose[cryptography]==3.3.0
-passlib[bcrypt]==1.7.4
-alembic==1.13.1
+python-multipart
+python-jose[cryptography]
+passlib[bcrypt]
+alembic
 
 # MySQL database driver
-PyMySQL==1.1.0
-cryptography==41.0.7
+PyMySQL
+cryptography
 
 # JWT Authentication
-PyJWT==2.8.0
+PyJWT
 
 # HTTP Requests for SMS
-requests==2.31.0
+requests
 
 # Excel generation and processing
-openpyxl==3.1.2
+openpyxl
 pandas==2.0.3
-python-multipart
+numpy==1.26.4
 
 # PostgreSQL driver for production deployments
-psycopg2-binary==2.9.9
+psycopg2-binary
+
+# PDF generation for offer letters
+reportlab

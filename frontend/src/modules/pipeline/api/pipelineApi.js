@@ -77,7 +77,7 @@ export const pipelineApi = {
       const blob = await response.blob();
       const disposition = response.headers.get('content-disposition') || '';
       const match = disposition.match(/filename="?([^"]+)"?/i);
-      const filename = match?.[1] || `offer-letter-${dealId}.html`;
+      const filename = match?.[1] || `offer-letter-${dealId}.pdf`;
 
       return { blob, filename };
     } catch (error) {

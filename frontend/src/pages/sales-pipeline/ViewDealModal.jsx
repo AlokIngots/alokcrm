@@ -163,29 +163,61 @@ const ViewDealModal = ({ deal, isOpen, onClose, dealStatus, onEditDealStatus, on
     }
 
     const lines = notes.split('\n').map((line) => line.trim()).filter(Boolean);
+    const fullText = lines.join('\n');
     const productLines = [];
     let inProducts = false;
+    let inItems = false;
+
+    const extractValueFromLine = (line) => {
+      const idx = line.indexOf(':');
+      if (idx === -1) return null;
+      return line.slice(idx + 1).trim() || null;
+    };
+
+    const extractValue = (lineRegex, textRegex) => {
+      const lineMatch = lines.find((line) => lineRegex.test(line));
+      if (lineMatch) return extractValueFromLine(lineMatch);
+      const textMatch = fullText.match(textRegex);
+      return textMatch?.[1]?.trim() || null;
+    };
+
+    const sectionHeaderRegex = /^(sale type|offer no|offer number|order progress|commercial|payment terms|payment|delivery|product lines|items)\s*:/i;
 
     for (const line of lines) {
-      if (line.startsWith('Product Lines')) {
+      if (/^product lines\s*:?/i.test(line)) {
         inProducts = true;
+        inItems = false;
         continue;
       }
-      if (inProducts && /^\d+\./.test(line)) {
-        productLines.push(line.replace(/^\d+\.\s*/, ''));
-        continue;
-      }
-      if (inProducts && !/^\d+\./.test(line)) {
+      if (/^items\s*:?/i.test(line)) {
+        inItems = true;
         inProducts = false;
+        continue;
+      }
+
+      if (inProducts || inItems) {
+        if (sectionHeaderRegex.test(line)) {
+          inProducts = false;
+          inItems = false;
+          continue;
+        }
+        productLines.push(line.replace(/^\d+\.\s*/, '').trim());
       }
     }
 
+    const delivery = extractValue(/^delivery\s*:/i, /delivery\s*:\s*([^;\n]+)/i);
+    const payment = extractValue(/^(payment terms|payment)\s*:/i, /payment(?:\s*terms)?\s*:\s*([^;\n]+)/i);
+    const commercialLine = extractValue(/^commercial\s*:/i, /commercial\s*:\s*([^;\n]+)/i);
+    const commercial = commercialLine || [delivery ? `Delivery: ${delivery}` : null, payment ? `Payment: ${payment}` : null]
+      .filter(Boolean)
+      .join(' | ') || null;
+
     return {
-      saleType: lines.find((line) => line.startsWith('Sale Type:'))?.replace('Sale Type:', '').trim() || null,
-      offerNo: lines.find((line) => line.startsWith('Offer No:'))?.replace('Offer No:', '').trim() || null,
-      productLines,
-      orderProgress: lines.find((line) => line.startsWith('Order Progress:'))?.replace('Order Progress:', '').trim() || null,
-      commercial: lines.find((line) => line.startsWith('Commercial:'))?.replace('Commercial:', '').trim() || null
+      saleType: extractValue(/^sale type\s*:/i, /sale type\s*:\s*([^;\n]+)/i),
+      offerNo: extractValue(/^offer (no|number)\s*:/i, /offer\s*(?:no|number)\s*:\s*([^;\n]+)/i),
+      productLines: [...new Set(productLines.filter(Boolean))],
+      orderProgress: extractValue(/^order progress\s*:/i, /order progress\s*:\s*([^;\n]+)/i),
+      commercial
     };
   };
 

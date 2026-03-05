@@ -1,13 +1,20 @@
 from fastapi import APIRouter, Depends, HTTPException, Path, Body
-from fastapi.responses import HTMLResponse
+from fastapi.responses import Response
 from sqlalchemy.orm import Session, joinedload
 from typing import List, Optional
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 import html
 import re
 import base64
+import io
+import logging
 from pathlib import Path as FilePath
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.units import mm
+from reportlab.platypus import Table, TableStyle
+from reportlab.pdfgen import canvas
 
 from database.db import get_db
 from database.tables.deals import Deal, DealCreate, DealUpdate, DealResponse, DealStatusEnum, DealDisplayUpdate, DealTemperatureEnum, DealTemperatureUpdate, DealFlagEnum
@@ -24,8 +31,10 @@ from database.tables.activity_log import create_stage_change_log, create_tempera
 from database.tables.notes import Note, NoteCreate, NoteUpdate, NoteResponse
 import services.v2_sync_service as v2_sync_service
 from services.business_rules import DEAL_STAGE_OFFER, normalize_sale_type, map_deal_stage_to_enquiry_status
+from services.quotation_service import send_quotation_email
 
 router = APIRouter()
+logger = logging.getLogger("crm.offer")
 
 
 def _get_offer_logo_data_uri() -> str:
@@ -51,6 +60,18 @@ def _get_offer_logo_data_uri() -> str:
     return ""
 
 
+def _get_offer_logo_path() -> Optional[FilePath]:
+    repo_root = FilePath(__file__).resolve().parents[4]
+    candidates = [
+        repo_root / "frontend" / "public" / "images" / "Alok_logo.png",
+        repo_root / "frontend" / "public" / "images" / "logo.png",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    return None
+
+
 def _extract_note_value(notes: Optional[str], prefix: str) -> Optional[str]:
     if not notes:
         return None
@@ -58,6 +79,26 @@ def _extract_note_value(notes: Optional[str], prefix: str) -> Optional[str]:
         line = raw.strip()
         if line.lower().startswith(prefix.lower()):
             return line.split(":", 1)[1].strip() if ":" in line else None
+    return None
+
+
+def _extract_note_value_flexible(notes: Optional[str], *prefixes: str) -> Optional[str]:
+    if not notes:
+        return None
+
+    lines = [line.strip() for line in notes.splitlines() if line.strip()]
+    for prefix in prefixes:
+        for line in lines:
+            if line.lower().startswith(prefix.lower()):
+                return line.split(":", 1)[1].strip() if ":" in line else None
+
+    full_text = "\n".join(lines)
+    for prefix in prefixes:
+        pattern = re.compile(rf"{re.escape(prefix)}\s*:\s*([^;\n]+)", re.IGNORECASE)
+        match = pattern.search(full_text)
+        if match:
+            return match.group(1).strip()
+
     return None
 
 
@@ -75,11 +116,29 @@ def _parse_product_lines_from_notes(notes: Optional[str]) -> List[dict]:
 
     lines = [line.strip() for line in notes.splitlines() if line.strip()]
     product_lines = [line for line in lines if re.match(r"^\d+\.\s*", line)]
+    if not product_lines:
+        in_items = False
+        stop_markers = re.compile(
+            r"^(offer\s*(no|number)|sale type|order progress|commercial|delivery|payment(\s*terms)?|enquiry id)\s*:",
+            re.IGNORECASE,
+        )
+        for line in lines:
+            if re.match(r"^items\s*:?", line, re.IGNORECASE):
+                in_items = True
+                continue
+            if not in_items:
+                continue
+            if stop_markers.match(line):
+                break
+            if "|" in line or re.match(r"^\d+\.\s*", line):
+                product_lines.append(line)
+
     parsed = []
 
     for idx, line in enumerate(product_lines, start=1):
         clean = re.sub(r"^\d+\.\s*", "", line)
-        parts = [p.strip() for p in clean.split("|")]
+        pipe_parts = [p.strip() for p in clean.split("|") if p.strip()]
+        parts = [p.strip() for p in re.split(r"[|;]", clean) if p.strip()]
 
         row = {
             "sr_no": idx,
@@ -93,12 +152,15 @@ def _parse_product_lines_from_notes(notes: Optional[str]) -> List[dict]:
             "rate": "",
         }
 
-        if len(parts) > 0:
-            row["product"] = parts[0]
-        if len(parts) > 2:
-            row["grade"] = parts[2]
-        if len(parts) > 3:
-            row["size"] = parts[3].replace("mm", " mm").strip()
+        if len(pipe_parts) >= 2 and ":" not in pipe_parts[0] and ":" not in pipe_parts[1]:
+            row["grade"] = pipe_parts[0]
+            row["product"] = pipe_parts[1]
+        elif len(pipe_parts) > 0:
+            row["product"] = pipe_parts[0]
+        if len(pipe_parts) > 2 and ":" not in pipe_parts[2] and not row["grade"]:
+            row["grade"] = pipe_parts[2]
+        if len(pipe_parts) > 3 and ":" not in pipe_parts[3]:
+            row["size"] = pipe_parts[3].replace("mm", " mm").strip()
 
         for part in parts:
             p = part.strip()
@@ -113,6 +175,12 @@ def _parse_product_lines_from_notes(notes: Optional[str]) -> List[dict]:
                 row["length"] = p.split(":", 1)[1].strip()
             elif l.startswith("price:") or l.startswith("rate:"):
                 row["rate"] = p.split(":", 1)[1].strip()
+            elif l.startswith("grade:"):
+                row["grade"] = p.split(":", 1)[1].strip()
+            elif l.startswith("product:"):
+                row["product"] = p.split(":", 1)[1].strip()
+            elif l.startswith("size:"):
+                row["size"] = p.split(":", 1)[1].strip()
             elif "dia:" in l and not row["size"]:
                 row["size"] = p.split(":", 1)[1].strip()
 
@@ -123,7 +191,7 @@ def _parse_product_lines_from_notes(notes: Optional[str]) -> List[dict]:
 
 def _render_offer_letter_html(deal: Deal) -> str:
     customer = deal.account.Name if deal.account else "Customer"
-    offer_no = _extract_note_value(deal.Notes, "Offer No") or _build_default_offer_no(deal)
+    offer_no = _extract_note_value_flexible(deal.Notes, "Offer No", "Offer Number") or _build_default_offer_no(deal)
     logo_uri = _get_offer_logo_data_uri()
     product_rows = _parse_product_lines_from_notes(deal.Notes)
     if not product_rows:
@@ -140,14 +208,11 @@ def _render_offer_letter_html(deal: Deal) -> str:
         }]
 
     date_text = datetime.now().strftime("%d-%m-%Y")
-    commercial = _extract_note_value(deal.Notes, "Commercial") or ""
-    payment_terms = "-"
-    delivery_days = "-"
+    payment_terms = _extract_note_value_flexible(deal.Notes, "Payment Terms", "Payment") or "-"
+    delivery_days = _extract_note_value_flexible(deal.Notes, "Delivery") or "-"
     validity = "4 Days"
-    if "Payment Terms=" in commercial:
-        payment_terms = commercial.split("Payment Terms=", 1)[1].split(",", 1)[0].strip() or "-"
-    if "Delivery=" in commercial:
-        delivery_days = commercial.split("Delivery=", 1)[1].split(",", 1)[0].strip() or "-"
+    salesperson = deal.salesperson.Name if deal.salesperson else "-"
+    contact_person = deal.contact.Name if deal.contact else "-"
 
     body_rows = []
     for row in product_rows:
@@ -180,30 +245,33 @@ def _render_offer_letter_html(deal: Deal) -> str:
       <meta charset="utf-8" />
       <title>Offer Letter - {html.escape(offer_no)}</title>
       <style>
-        @page {{ size: A4; margin: 18mm 14mm; }}
+        @page {{ size: A4; margin: 16mm 12mm; }}
         body {{ font-family: 'Segoe UI', Arial, sans-serif; margin: 0; color: #111827; background: #fff; }}
         .sheet {{ max-width: 210mm; margin: 0 auto; }}
-        .header {{ display:flex; justify-content:space-between; align-items:flex-start; margin-bottom: 10px; }}
-        .logo {{ height: 72px; width: auto; object-fit: contain; }}
+        .header {{ display:flex; justify-content:space-between; align-items:flex-start; margin-bottom: 8px; }}
+        .logo {{ height: 64px; width: auto; object-fit: contain; }}
         .logo-fallback {{ font-size: 28px; font-weight: 800; letter-spacing: 1px; }}
         .header-right {{ text-align: right; font-size: 12px; color: #4b5563; }}
-        .company-line {{ border-top: 1px solid #d1d5db; margin: 10px 0 14px; }}
-        .topmeta {{ display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; }}
+        .company-line {{ border-top: 2px solid #e57f36; margin: 8px 0 12px; }}
+        .topmeta {{ display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; }}
         .cert {{ font-size: 12px; color: #374151; letter-spacing: 0.3px; }}
-        .date {{ font-size: 30px; font-weight: 800; }}
-        .meta {{ margin-bottom: 14px; }}
-        .meta p {{ margin: 6px 0; font-size: 14px; }}
+        .date {{ font-size: 24px; font-weight: 800; }}
+        .meta {{ margin-bottom: 12px; border: 1px solid #e5e7eb; border-radius: 8px; padding: 10px 12px; background: #fafafa; }}
+        .meta p {{ margin: 4px 0; font-size: 13px; }}
         .meta .k {{ display:inline-block; min-width: 150px; font-weight: 700; color: #111827; }}
-        .meta .v {{ font-weight: 700; font-size: 16px; letter-spacing: 0.2px; }}
-        table {{ width:100%; border-collapse: collapse; margin-top:10px; }}
-        th, td {{ border:1px solid #9ca3af; padding:7px 6px; font-size:12px; text-align:center; vertical-align:middle; }}
-        th {{ background:#f3f4f6; font-weight: 700; }}
+        .meta .v {{ font-weight: 700; font-size: 15px; letter-spacing: 0.2px; }}
+        table {{ width:100%; border-collapse: collapse; margin-top:8px; }}
+        th, td {{ border:1px solid #9ca3af; padding:6px 5px; font-size:11px; text-align:center; vertical-align:middle; }}
+        th {{ background:#eef2ff; font-weight: 700; }}
         td:nth-child(4), td:nth-child(5), td:nth-child(6), td:nth-child(7), td:nth-child(8), td:nth-child(9) {{ font-size: 11px; }}
-        .terms {{ margin-top: 18px; max-width: 520px; }}
-        .terms-row {{ display:flex; align-items:flex-start; margin: 6px 0; font-size: 14px; }}
+        .terms {{ margin-top: 14px; max-width: 520px; border: 1px solid #e5e7eb; border-radius: 8px; padding: 8px 12px; background: #fafafa; }}
+        .terms-row {{ display:flex; align-items:flex-start; margin: 4px 0; font-size: 13px; }}
         .terms-k {{ width: 140px; font-weight: 700; }}
         .terms-v {{ font-weight: 600; }}
-        .footer {{ margin-top: 34px; border-top: 2px solid #e57f36; padding-top: 10px; font-size: 11px; color:#1f2937; display:flex; justify-content:space-between; gap: 20px; }}
+        .sign {{ margin-top: 20px; display:flex; justify-content:flex-end; }}
+        .sign-box {{ min-width: 220px; text-align:center; }}
+        .sign-line {{ margin-top: 30px; border-top: 1px solid #6b7280; padding-top: 4px; font-size: 11px; color: #4b5563; }}
+        .footer {{ margin-top: 16px; border-top: 2px solid #e57f36; padding-top: 8px; font-size: 10px; color:#1f2937; display:flex; justify-content:space-between; gap: 20px; }}
         .footer h4 {{ margin: 0 0 4px; font-size: 12px; font-weight: 800; }}
         .footer p {{ margin: 0; line-height: 1.45; }}
       </style>
@@ -224,6 +292,8 @@ def _render_offer_letter_html(deal: Deal) -> str:
       <div class="meta">
         <p><span class="k">CUSTOMER</span>: <span class="v">{html.escape(customer)}</span></p>
         <p><span class="k">OFFER NUMBER</span>: <span class="v">{html.escape(offer_no)}</span></p>
+        <p><span class="k">CONTACT PERSON</span>: <span class="v">{html.escape(contact_person)}</span></p>
+        <p><span class="k">SALESPERSON</span>: <span class="v">{html.escape(salesperson)}</span></p>
       </div>
       <table>
         <thead>
@@ -240,6 +310,11 @@ def _render_offer_letter_html(deal: Deal) -> str:
         <div class="terms-row"><div class="terms-k">Delivery Days</div><div class="terms-v">: {html.escape(delivery_days)}</div></div>
         <div class="terms-row"><div class="terms-k">Payment Terms</div><div class="terms-v">: {html.escape(payment_terms)}</div></div>
       </div>
+      <div class="sign">
+        <div class="sign-box">
+          <div class="sign-line">Authorized Signatory</div>
+        </div>
+      </div>
       <div class="footer">
         <div>
           <h4>ALOK INGOTS (MUMBAI) PVT LTD</h4>
@@ -254,6 +329,180 @@ def _render_offer_letter_html(deal: Deal) -> str:
     </body>
     </html>
     """
+
+
+def _render_offer_letter_pdf(deal: Deal) -> bytes:
+    customer = deal.account.Name if deal.account else "Customer"
+    offer_no = _extract_note_value_flexible(deal.Notes, "Offer No", "Offer Number") or _build_default_offer_no(deal)
+    product_rows = _parse_product_lines_from_notes(deal.Notes)
+    if not product_rows:
+        product_rows = [{
+            "sr_no": 1,
+            "grade": "",
+            "product": deal.ServiceType or "",
+            "size": "",
+            "qty": "",
+            "ht": "",
+            "tol": "",
+            "length": "",
+            "rate": deal.DealValue or "",
+        }]
+
+    payment_terms = _extract_note_value_flexible(deal.Notes, "Payment Terms", "Payment") or "-"
+    delivery_days = _extract_note_value_flexible(deal.Notes, "Delivery") or "-"
+    validity_raw = _extract_note_value_flexible(deal.Notes, "Offer Validity Date", "Validity Date", "Validity")
+    offer_date = datetime.now().date()
+    validity_days = 4
+    if validity_raw and validity_raw.isdigit():
+        validity_days = max(int(validity_raw), 1)
+    validity_date = offer_date + timedelta(days=validity_days)
+    offer_date_text = offer_date.strftime("%d-%m-%Y")
+    validity_date_text = validity_date.strftime("%d-%m-%Y")
+    if validity_raw and not validity_raw.isdigit():
+        validity_date_text = validity_raw
+
+    salesperson = deal.salesperson.Name if deal.salesperson else "-"
+    contact_person = deal.contact.Name if deal.contact else "-"
+    deal_value_text = f"Rs {deal.DealValue:,.2f}" if deal.DealValue is not None else "-"
+    expected_closure_text = (
+        deal.ExpectedClosureDate.strftime("%d-%m-%Y")
+        if deal.ExpectedClosureDate
+        else "-"
+    )
+
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    width, height = A4
+    left = 14 * mm
+    right = width - (14 * mm)
+    y = height - (14 * mm)
+
+    logo_path = _get_offer_logo_path()
+    if logo_path:
+        c.drawImage(str(logo_path), left, y - 16 * mm, width=40 * mm, height=14 * mm, preserveAspectRatio=True, mask="auto")
+
+    c.setFont("Helvetica-Bold", 9)
+    c.setFillColor(colors.HexColor("#374151"))
+    c.circle(right - 9 * mm, y - 6 * mm, 6 * mm, stroke=1, fill=0)
+    c.drawCentredString(right - 9 * mm, y - 5.2 * mm, "ISO")
+    c.drawRightString(right - 18 * mm, y - 6 * mm, "ISO 9001:2015 Certified")
+
+    c.setFillColor(colors.HexColor("#111827"))
+    c.setFont("Helvetica-Bold", 16)
+    c.drawRightString(right, y - 12 * mm, "Techno-Commercial Offer")
+    y -= 20 * mm
+
+    c.setStrokeColor(colors.HexColor("#e57f36"))
+    c.setLineWidth(1.5)
+    c.line(left, y, right, y)
+    y -= 8 * mm
+
+    # Offer Information
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(left, y, "Offer Information")
+    y -= 6 * mm
+
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(left, y, "Offer Number:")
+    c.setFont("Helvetica", 10)
+    c.drawString(left + 28 * mm, y, str(offer_no))
+    y -= 6 * mm
+
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(left, y, "Offer Date:")
+    c.setFont("Helvetica", 10)
+    c.drawString(left + 28 * mm, y, offer_date_text)
+    y -= 6 * mm
+
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(left, y, "Offer Validity Date:")
+    c.setFont("Helvetica", 10)
+    c.drawString(left + 28 * mm, y, validity_date_text)
+    y -= 8 * mm
+
+    # Customer Details
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(left, y, "Customer Details")
+    y -= 6 * mm
+
+    detail_rows = [
+        ("Customer Name", customer),
+        ("Product / Service", deal.ServiceType or "-"),
+        ("Division", deal.Division or "-"),
+        ("Deal Value", deal_value_text),
+        ("Lead Source", deal.LeadSource or "-"),
+        ("Expected Closure Date", expected_closure_text),
+        ("Salesperson Name", salesperson),
+        ("Contact Person", contact_person),
+    ]
+    for label, value in detail_rows:
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(left, y, f"{label}:")
+        c.setFont("Helvetica", 10)
+        c.drawString(left + 38 * mm, y, str(value))
+        y -= 5 * mm
+    y -= 10 * mm
+
+    headers = ["Sr", "Grade", "Product", "Size", "Qty", "HT", "TOL", "Length", "Rate"]
+    rows = [headers]
+    for row in product_rows:
+        rows.append([
+            str(row.get("sr_no", "")),
+            str(row.get("grade", "") or "-"),
+            str(row.get("product", "") or "-"),
+            str(row.get("size", "") or "-"),
+            str(row.get("qty", "") or "-"),
+            str(row.get("ht", "") or "-"),
+            str(row.get("tol", "") or "-"),
+            str(row.get("length", "") or "-"),
+            str(row.get("rate", "") or "-"),
+        ])
+
+    col_widths = [10 * mm, 20 * mm, 38 * mm, 20 * mm, 14 * mm, 14 * mm, 16 * mm, 20 * mm, 20 * mm]
+    table = Table(rows, colWidths=col_widths, repeatRows=1)
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eef2ff")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#111827")),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("GRID", (0, 0), (-1, -1), 0.6, colors.HexColor("#9ca3af")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#fafafa")]),
+    ]))
+
+    table_width, table_height = table.wrap(0, 0)
+    table.drawOn(c, left, y - table_height)
+    y -= table_height + 10 * mm
+
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(left, y, "Commercial Terms")
+    y -= 6 * mm
+    c.setFont("Helvetica", 10)
+    c.drawString(left, y, f"Validity: {validity_days} Days")
+    y -= 5 * mm
+    c.drawString(left, y, f"Delivery Days: {delivery_days}")
+    y -= 5 * mm
+    c.drawString(left, y, f"Payment Terms: {payment_terms}")
+
+    c.setFont("Helvetica", 10)
+    c.drawRightString(right, 30 * mm, "For Alok Ingots (Mumbai) Pvt Ltd")
+    c.line(right - 60 * mm, 24 * mm, right, 24 * mm)
+    c.drawRightString(right, 20 * mm, "Authorized Signatory")
+
+    c.setStrokeColor(colors.HexColor("#e57f36"))
+    c.setLineWidth(1.2)
+    c.line(left, 16 * mm, right, 16 * mm)
+    c.setFont("Helvetica", 8)
+    c.setFillColor(colors.HexColor("#374151"))
+    c.drawString(left, 12 * mm, "ALOK INGOTS (MUMBAI) PVT LTD | Nariman Point, Mumbai | +91 22 4022008")
+    c.drawRightString(right, 12 * mm, "Manufacturing Unit: Wada, Palghar")
+
+    c.showPage()
+    c.save()
+    return buf.getvalue()
+
 
 def format_deal_response_with_access(deal: Deal, is_draggable: bool = False) -> dict:
     """Helper function to format deal with related data and access controls"""
@@ -317,6 +566,37 @@ def _sync_related_enquiry_status(db: Session, deal: Deal, new_stage: str) -> Non
 
     enquiry.Status = next_status
     v2_sync_service.sync_enquiry(db, enquiry, sale_type_hint=deal.Division)
+
+
+def _resolve_quotation_recipient_email(db: Session, deal: Deal) -> Optional[str]:
+    """
+    Prefer customer email from the most relevant enquiry contact.
+    Fallback to deal contact email.
+    """
+    enquiry = (
+        db.query(Enquiry)
+        .options(joinedload(Enquiry.contact))
+        .filter(
+            Enquiry.AccountID == deal.AccountID,
+            Enquiry.ContactID == deal.ContactID,
+            Enquiry.OwnerECode == deal.SalespersonECode,
+        )
+        .order_by(Enquiry.id.desc())
+        .first()
+    )
+    if enquiry and enquiry.contact:
+        if enquiry.contact.Email1:
+            return enquiry.contact.Email1
+        if enquiry.contact.Email2:
+            return enquiry.contact.Email2
+
+    if deal.contact:
+        if deal.contact.Email1:
+            return deal.contact.Email1
+        if deal.contact.Email2:
+            return deal.contact.Email2
+
+    return None
 
 @router.get("/", response_model=List[DealResponse])
 async def get_all_deals(
@@ -408,7 +688,7 @@ async def download_offer_letter(
     db: Session = Depends(get_db)
 ):
     """
-    Download offer letter for a deal as an HTML file.
+    Download offer letter for a deal as a PDF file.
     """
     access_service = DealAccessService(db)
     if not access_service.has_deal_access(current_user.ECode, deal_id, current_user.Role):
@@ -426,10 +706,11 @@ async def download_offer_letter(
     if deal.Stage != DEAL_STAGE_OFFER:
         raise HTTPException(status_code=400, detail="Offer letter can be downloaded only in Offer stage")
 
-    offer_html = _render_offer_letter_html(deal)
-    filename = f"offer-letter-{deal_id}.html"
-    return HTMLResponse(
-        content=offer_html,
+    offer_pdf = _render_offer_letter_pdf(deal)
+    filename = f"offer-letter-{deal_id}.pdf"
+    return Response(
+        content=offer_pdf,
+        media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'}
     )
 
@@ -747,6 +1028,7 @@ async def update_deal_stage(
         # Store the old stage before updating
         old_stage = deal.Stage or "Not Set"
         new_stage = stage_update.Stage
+        should_send_quotation = False
         
         # Only create activity log if stage actually changed
         if old_stage != new_stage:
@@ -771,9 +1053,9 @@ async def update_deal_stage(
                 reason=f"Moved from {old_stage} to {new_stage}",
             )
             if v2_sync_service.normalize_stage(new_stage) == "OFFER":
-                offer_no = _extract_note_value(deal.Notes, "Offer No") or _build_default_offer_no(deal)
-                payment_terms = _extract_note_value(deal.Notes, "Payment Terms")
-                delivery_days = _extract_note_value(deal.Notes, "Delivery")
+                offer_no = _extract_note_value_flexible(deal.Notes, "Offer No", "Offer Number") or _build_default_offer_no(deal)
+                payment_terms = _extract_note_value_flexible(deal.Notes, "Payment Terms", "Payment")
+                delivery_days = _extract_note_value_flexible(deal.Notes, "Delivery")
                 v2_sync_service.ensure_v2_offer_for_deal(
                     db=db,
                     deal_id=deal.ID,
@@ -782,6 +1064,7 @@ async def update_deal_stage(
                     payment_terms=payment_terms,
                     delivery_days=delivery_days,
                 )
+                should_send_quotation = True
             _sync_related_enquiry_status(db, deal, new_stage)
         
         db.commit()
@@ -794,6 +1077,44 @@ async def update_deal_stage(
             joinedload(Deal.lead_generator),
             joinedload(Deal.kam)
         ).filter(Deal.ID == deal_id).first()
+
+        recipient_email = _resolve_quotation_recipient_email(db, updated_deal) if updated_deal else None
+        if should_send_quotation and updated_deal:
+            if recipient_email:
+                offer_no = _extract_note_value_flexible(updated_deal.Notes, "Offer No", "Offer Number") or _build_default_offer_no(updated_deal)
+                pdf_bytes = _render_offer_letter_pdf(updated_deal)
+                filename = f"techno-commercial-offer-{updated_deal.ID}.pdf"
+                sent, reason = send_quotation_email(
+                    to_email=recipient_email,
+                    customer_name=updated_deal.account.Name if updated_deal.account else "Customer",
+                    offer_number=offer_no,
+                    salesperson_name=updated_deal.salesperson.Name if updated_deal.salesperson else "-",
+                    pdf_bytes=pdf_bytes,
+                    filename=filename,
+                )
+                logger.info(
+                    "quotation_auto_send deal_id=%s email=%s sent=%s reason=%s",
+                    updated_deal.ID,
+                    recipient_email,
+                    sent,
+                    reason,
+                )
+                action = (
+                    f"quotation email sent to {recipient_email}"
+                    if sent
+                    else f"quotation email failed to {recipient_email} ({reason})"
+                )
+            else:
+                action = "quotation email skipped (no customer email found in enquiry/contact)"
+
+            db.add(
+                ActivityLog(
+                    DealID=updated_deal.ID,
+                    ECode=current_user.ECode,
+                    Action=action,
+                )
+            )
+            db.commit()
         
         is_draggable = access_service.is_deal_draggable(updated_deal, current_user.ECode, False)
         
