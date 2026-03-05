@@ -7,7 +7,6 @@ cd backend
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
- uvicorn main:app --reload
 python main.py
 ```
 
@@ -21,7 +20,7 @@ Set `.env` in `backend/`:
 DATABASE_URL=sqlite:///./database.db
 JWT_SECRET_KEY=change_this_for_prod
 SMS_MODE=mock
-CORS_ORIGINS=http://localhost:3000
+CORS_ORIGINS=http://localhost:3000 s
 LOG_LEVEL=INFO
 ```
 

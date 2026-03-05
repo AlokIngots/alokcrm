@@ -17,6 +17,7 @@ import SetActuals from './pages/actuals/SetActuals';
 import ActivityLog from './pages/activity-log/ActivityLog';
 import Enquiries from './pages/enquiries/Enquiries';
 import Products from './pages/products/Products';
+import ProtectedRoute from './components/auth/ProtectedRoute';
 import './App.css';
 
 function App() {
@@ -28,7 +29,7 @@ function App() {
         
         {/* Protected Routes */}
         <Route path="/*" element={
-          // <ProtectedRoute>
+           <ProtectedRoute>
             <AccessControlProvider>
               <div className="App min-h-screen flex bg-gray-50">
                 <Sidebar />
@@ -57,7 +58,7 @@ function App() {
                 </main>
               </div>
             </AccessControlProvider>
-          // </ProtectedRoute>
+         </ProtectedRoute>
         } />
       </Routes>
     </Router>
