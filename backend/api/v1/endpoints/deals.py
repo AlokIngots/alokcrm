@@ -13,7 +13,8 @@ from pathlib import Path as FilePath
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.units import mm
-from reportlab.platypus import Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import Table, TableStyle, Paragraph
 from reportlab.pdfgen import canvas
 
 from database.db import get_db
@@ -375,124 +376,133 @@ def _render_offer_letter_pdf(deal: Deal) -> bytes:
     width, height = A4
     left = 14 * mm
     right = width - (14 * mm)
+    content_width = right - left
     y = height - (14 * mm)
 
     logo_path = _get_offer_logo_path()
     if logo_path:
-        c.drawImage(str(logo_path), left, y - 16 * mm, width=40 * mm, height=14 * mm, preserveAspectRatio=True, mask="auto")
+        c.drawImage(str(logo_path), left, y - 15 * mm, width=42 * mm, height=13 * mm, preserveAspectRatio=True, mask="auto")
 
-    c.setFont("Helvetica-Bold", 9)
     c.setFillColor(colors.HexColor("#374151"))
-    c.circle(right - 9 * mm, y - 6 * mm, 6 * mm, stroke=1, fill=0)
-    c.drawCentredString(right - 9 * mm, y - 5.2 * mm, "ISO")
-    c.drawRightString(right - 18 * mm, y - 6 * mm, "ISO 9001:2015 Certified")
-
+    c.setFont("Helvetica-Bold", 10)
+    c.drawRightString(right, y - 3 * mm, "ISO 9001:2015 Certified")
     c.setFillColor(colors.HexColor("#111827"))
-    c.setFont("Helvetica-Bold", 16)
-    c.drawRightString(right, y - 12 * mm, "Techno-Commercial Offer")
+    c.setFont("Helvetica-Bold", 20)
+    c.drawRightString(right, y - 11 * mm, "Sales Offer")
     y -= 20 * mm
 
     c.setStrokeColor(colors.HexColor("#e57f36"))
-    c.setLineWidth(1.5)
+    c.setLineWidth(1.4)
     c.line(left, y, right, y)
-    y -= 8 * mm
+    y -= 7 * mm
 
-    # Offer Information
-    c.setFont("Helvetica-Bold", 11)
-    c.drawString(left, y, "Offer Information")
-    y -= 6 * mm
+    def _draw_section_title(title: str, top_y: float) -> float:
+        c.setFillColor(colors.HexColor("#111827"))
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(left, top_y, title)
+        return top_y - 5 * mm
 
-    c.setFont("Helvetica-Bold", 10)
-    c.drawString(left, y, "Offer Number:")
-    c.setFont("Helvetica", 10)
-    c.drawString(left + 28 * mm, y, str(offer_no))
-    y -= 6 * mm
+    def _draw_key_value_table(rows: list[list[str]], top_y: float) -> float:
+        t = Table(rows, colWidths=[44 * mm, content_width - 44 * mm])
+        t.setStyle(TableStyle([
+            ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+            ("FONTNAME", (1, 0), (1, -1), "Helvetica"),
+            ("FONTSIZE", (0, 0), (-1, -1), 10),
+            ("TEXTCOLOR", (0, 0), (-1, -1), colors.HexColor("#111827")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("ALIGN", (0, 0), (0, -1), "LEFT"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+            ("TOPPADDING", (0, 0), (-1, -1), 1),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+        ]))
+        _, th = t.wrap(content_width, 0)
+        t.drawOn(c, left, top_y - th)
+        return top_y - th - 4 * mm
 
-    c.setFont("Helvetica-Bold", 10)
-    c.drawString(left, y, "Offer Date:")
-    c.setFont("Helvetica", 10)
-    c.drawString(left + 28 * mm, y, offer_date_text)
-    y -= 6 * mm
+    y = _draw_section_title("Offer Information", y)
+    y = _draw_key_value_table([
+        ["Offer Number", str(offer_no)],
+        ["Offer Date", offer_date_text],
+        ["Offer Validity Date", validity_date_text],
+    ], y)
 
-    c.setFont("Helvetica-Bold", 10)
-    c.drawString(left, y, "Offer Validity Date:")
-    c.setFont("Helvetica", 10)
-    c.drawString(left + 28 * mm, y, validity_date_text)
-    y -= 8 * mm
-
-    # Customer Details
-    c.setFont("Helvetica-Bold", 11)
-    c.drawString(left, y, "Customer Details")
-    y -= 6 * mm
-
-    detail_rows = [
-        ("Customer Name", customer),
-        ("Product / Service", deal.ServiceType or "-"),
-        ("Division", deal.Division or "-"),
-        ("Deal Value", deal_value_text),
-        ("Lead Source", deal.LeadSource or "-"),
-        ("Expected Closure Date", expected_closure_text),
-        ("Salesperson Name", salesperson),
-        ("Contact Person", contact_person),
-    ]
-    for label, value in detail_rows:
-        c.setFont("Helvetica-Bold", 10)
-        c.drawString(left, y, f"{label}:")
-        c.setFont("Helvetica", 10)
-        c.drawString(left + 38 * mm, y, str(value))
-        y -= 5 * mm
-    y -= 10 * mm
+    y = _draw_section_title("Customer Details", y)
+    y = _draw_key_value_table([
+        ["Customer Name", customer],
+        ["Product / Service", deal.ServiceType or "-"],
+        ["Division", deal.Division or "-"],
+        ["Deal Value", deal_value_text],
+        ["Lead Source", deal.LeadSource or "-"],
+        ["Expected Closure Date", expected_closure_text],
+        ["Salesperson Name", salesperson],
+        ["Contact Person", contact_person],
+    ], y)
 
     headers = ["Sr", "Grade", "Product", "Size", "Qty", "HT", "TOL", "Length", "Rate"]
     rows = [headers]
+    styles = getSampleStyleSheet()
+    cell_style = styles["BodyText"]
+    cell_style.fontName = "Helvetica"
+    cell_style.fontSize = 8
+    cell_style.leading = 9
+    cell_style.wordWrap = "CJK"
+
+    def _cell_text(value: str) -> Paragraph:
+        safe = html.escape((value or "-").replace(",", ", "))
+        return Paragraph(safe, cell_style)
+
     for row in product_rows:
         rows.append([
             str(row.get("sr_no", "")),
-            str(row.get("grade", "") or "-"),
-            str(row.get("product", "") or "-"),
-            str(row.get("size", "") or "-"),
-            str(row.get("qty", "") or "-"),
-            str(row.get("ht", "") or "-"),
-            str(row.get("tol", "") or "-"),
-            str(row.get("length", "") or "-"),
-            str(row.get("rate", "") or "-"),
+            _cell_text(str(row.get("grade", "") or "-")),
+            _cell_text(str(row.get("product", "") or "-")),
+            _cell_text(str(row.get("size", "") or "-")),
+            _cell_text(str(row.get("qty", "") or "-")),
+            _cell_text(str(row.get("ht", "") or "-")),
+            _cell_text(str(row.get("tol", "") or "-")),
+            _cell_text(str(row.get("length", "") or "-")),
+            _cell_text(str(row.get("rate", "") or "-")),
         ])
 
-    col_widths = [10 * mm, 20 * mm, 38 * mm, 20 * mm, 14 * mm, 14 * mm, 16 * mm, 20 * mm, 20 * mm]
-    table = Table(rows, colWidths=col_widths, repeatRows=1)
-    table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eef2ff")),
+    product_table = Table(
+        rows,
+        colWidths=[10 * mm, 18 * mm, 34 * mm, 26 * mm, 14 * mm, 14 * mm, 14 * mm, 19 * mm, 17 * mm],
+        repeatRows=1,
+    )
+    product_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f3f4f6")),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#111827")),
         ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
-        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("FONTSIZE", (0, 0), (-1, 0), 8.5),
         ("ALIGN", (0, 0), (-1, -1), "CENTER"),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("GRID", (0, 0), (-1, -1), 0.6, colors.HexColor("#9ca3af")),
+        ("LEFTPADDING", (0, 0), (-1, -1), 3),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#9ca3af")),
         ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#fafafa")]),
     ]))
+    _, pth = product_table.wrap(content_width, 0)
+    product_table.drawOn(c, left, y - pth)
+    y -= pth + 7 * mm
 
-    table_width, table_height = table.wrap(0, 0)
-    table.drawOn(c, left, y - table_height)
-    y -= table_height + 10 * mm
+    y = _draw_section_title("Commercial Terms", y)
+    y = _draw_key_value_table([
+        ["Validity", f"{validity_days} Days"],
+        ["Delivery Days", str(delivery_days)],
+        ["Payment Terms", str(payment_terms)],
+    ], y)
 
-    c.setFont("Helvetica-Bold", 10)
-    c.drawString(left, y, "Commercial Terms")
-    y -= 6 * mm
-    c.setFont("Helvetica", 10)
-    c.drawString(left, y, f"Validity: {validity_days} Days")
-    y -= 5 * mm
-    c.drawString(left, y, f"Delivery Days: {delivery_days}")
-    y -= 5 * mm
-    c.drawString(left, y, f"Payment Terms: {payment_terms}")
-
+    c.setFillColor(colors.HexColor("#111827"))
     c.setFont("Helvetica", 10)
     c.drawRightString(right, 30 * mm, "For Alok Ingots (Mumbai) Pvt Ltd")
-    c.line(right - 60 * mm, 24 * mm, right, 24 * mm)
+    c.line(right - 62 * mm, 24 * mm, right, 24 * mm)
     c.drawRightString(right, 20 * mm, "Authorized Signatory")
 
     c.setStrokeColor(colors.HexColor("#e57f36"))
-    c.setLineWidth(1.2)
+    c.setLineWidth(1.1)
     c.line(left, 16 * mm, right, 16 * mm)
     c.setFont("Helvetica", 8)
     c.setFillColor(colors.HexColor("#374151"))
@@ -1083,7 +1093,7 @@ async def update_deal_stage(
             if recipient_email:
                 offer_no = _extract_note_value_flexible(updated_deal.Notes, "Offer No", "Offer Number") or _build_default_offer_no(updated_deal)
                 pdf_bytes = _render_offer_letter_pdf(updated_deal)
-                filename = f"techno-commercial-offer-{updated_deal.ID}.pdf"
+                filename = f"sales-offer-{updated_deal.ID}.pdf"
                 sent, reason = send_quotation_email(
                     to_email=recipient_email,
                     customer_name=updated_deal.account.Name if updated_deal.account else "Customer",

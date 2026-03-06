@@ -41,11 +41,11 @@ def send_quotation_email(
     msg = EmailMessage()
     msg["From"] = smtp_from
     msg["To"] = to_email
-    msg["Subject"] = f"Techno-Commercial Offer - {offer_number}"
+    msg["Subject"] = f"Sales Offer - {offer_number}"
     msg.set_content(
         f"""Dear {customer_name},
 
-Please find attached the techno-commercial offer.
+Please find attached the sales offer.
 
 Offer Number: {offer_number}
 Prepared By: {salesperson_name}
